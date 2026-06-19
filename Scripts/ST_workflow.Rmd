@@ -1,0 +1,113 @@
+---
+title: "ST_workflow"
+author: "Stefania Pirrotta"
+date: "2026-06-18"
+output: html_document
+---
+
+# Prepare Data
+In this workflow, we present the analyses to investigate with `mitology` the ST dataset of Lin et al. (GEO ID: GSE284089, Lin W, Li Y, Qiu C et al. Mapping the spatial atlas of the human bone tissue integrating spatial and single-cell transcriptomics. Nucleic Acids Research, 2025;53(2):gkae1298). We download the dataset using the `GEOquery` R package (version 2.80.0). The `SpatialExperiment` object provides the raw count expression values.
+
+```{r}
+library(GEOquery)
+gse <- getGEO("GSE284089", GSEMatrix = TRUE, AnnotGPL = TRUE, destdir = dir)[[1]]
+metadata <- pData(gse)
+getGEOSuppFiles("GSE284089", baseDir = dir)
+
+library(SpatialExperiment)
+sce <- DropletUtils::read10xCounts("GSE284089/GSE284089_RAW_spe/raw_feature_bc_matrix")
+img <- readImgData(path = "GSE284089/GSE284089_RAW_spe/spatial", sample_id = "GSE284089")
+xyz <- read.csv("GSE284089/GSE284089_RAW_spe/spatial/tissue_positions.csv.gz", header = TRUE)
+xyz <- xyz[match(sce@colData@listData[["Barcode"]], xyz$barcode),]
+rd <- S4Vectors::DataFrame(symbol = rowData(sce)$Symbol)
+
+spe <- SpatialExperiment(
+  assays = list(counts = assay(sce)),
+  rowData = rd, 
+  colData = DataFrame(xyz), 
+  spatialCoordsNames = c("pxl_col_in_fullres", "pxl_row_in_fullres"),
+  imgData = img,
+  sample_id = "GSE284089")
+```
+
+We then performed the quality control (scater, v 1.40.0), normalization (scran, v 1.40.0), feature selection and dimensionality reduction.
+
+```{r}
+library(scater)
+spe <- addPerCellQC(spe)
+spe <- spe[, spe$sum >= 100]
+
+library(scran)
+spe <- spe[apply(assay(spe) > 0, 1, any),]
+spe <- computeLibraryFactors(spe)
+spe <- logNormCounts(spe)
+
+dec <- modelGeneVar(spe)
+hvgs <- getTopHVGs(dec, prop = .2)
+
+set.seed(12345)
+spe <- runPCA(spe, subset_row = hvgs)
+spe <- runUMAP(spe, dimred = "PCA")
+```
+
+We performed Leiden clustering using the components of the principal component analysis.
+
+```{r}
+k <- 50
+g <- buildSNNGraph(spe, k = k, use.dimred = "PCA")
+k <- igraph::cluster_leiden(g, objective_function="modularity", resolution=.6)
+spe$Leiden <- factor(k$membership)
+
+# Figure 1H
+plotVisium(spe, annotate = "Leiden", image = TRUE)
+```
+
+# Enrichment Analysis
+We then computed the ssGSEA scores on Reactome database included in mitology and the corresponding original database.
+
+```{r}
+library(mitology)
+library(GSVA)
+RT_list <- getGeneSets(database = "Reactome")
+ssgseaRes <- gsva(ssgseaParam(exprData = spe, assay = "logcounts", geneSets = RT_list))
+ssgseaResA <- aggregateAcrossCells(
+    ssgseaRes, ids = spe$Leiden, use.assay.type = "es", statistics = "mean")
+
+library(graphite)
+humanReactome <- pathways("hsapiens", "reactome")
+hREnsembl <- convertIdentifiers(humanReactome, "ENSEMBL")
+hREnsembl_g <- lapply(hREnsembl, function(x){substring(nodes(x),9)})
+hREnsembl_g <- hREnsembl_g[lengths(hREnsembl_g)>0]
+hREnsembl_g <- hREnsembl_g[!duplicated(names(hREnsembl_g))]
+names(hREnsembl_g) <- mitology:::.mitologyName(names = names(hREnsembl_g), database = "Reactome")
+hREnsembl_g <- hREnsembl_g[names(hREnsembl_g) %in% names(RT_list)]
+ssgseaRTall <- gsva(ssgseaParam(
+    exprData = spe, assay = "logcounts", geneSets = hREnsembl_g, minSize = 10))
+ssgseaRTallA <- aggregateAcrossCells(
+  ssgseaRTall, ids = spe$Leiden, use.assay.type = "es", statistics = "mean")
+
+pvals <- list()
+for (db in c("RT", "RTall")){
+  pvals_db <- c()
+  if (db == "RT"){ dbes <- ssgseaRes } else { dbes <- ssgseaRTall }
+  for (i in 1:nrow(assay(dbes))){
+    t_ssgsea <- t.test(as.vector(assay(dbes)[i, spe$Leiden==1]), 
+                       as.vector(assay(dbes)[i, spe$Leiden==2]))
+    pvals_db <- c(pvals_db, t_ssgsea$p.value) }
+  names(pvals_db) <- rownames(dbes)
+  pvals[[db]] <- pvals_db }
+
+pvals <- lapply(pvals, method = "fdr", p.adjust)
+pvals <- lapply(pvals, function(x) x[x < .0001])
+
+ssgseaRTA <- merge(assay(ssgseaResA[names(pvals$RT),]), 
+                   assay(ssgseaRTallA[names(pvals$RTall),]), 
+                   by = 0, all = TRUE)
+rownames(ssgseaRTA) <- ssgseaRTA$Row.names
+ssgseaRTA <- ssgseaRTA[,2:5]
+colnames(ssgseaRTA) <- c("n1_mito", "n2_mito", "n1_orig", "n2_orig")
+
+# Figure 1I
+mitoTreeHeatmap(data = ssgseaRTA, database = "Reactome", labelNames = "leaves", font.size = 3)
+```
+
